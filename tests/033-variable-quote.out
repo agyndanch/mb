@@ -1,0 +1,2 @@
+Hello your language is en_US.UTF-8
+Hello your language is ${LANG}

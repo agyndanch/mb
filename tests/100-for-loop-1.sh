@@ -1,0 +1,5 @@
+
+for a in 1 2 3 4 "done"
+do
+    echo $a
+done
