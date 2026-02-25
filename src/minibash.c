@@ -98,8 +98,7 @@ struct job {
     int  num_processes_alive;   /* The number of processes that we know to be alive */
 
     pid_t pgid;              /* Process group id for this job */
-    int   exit_status;       /* Exit status of the last command in this job */
-    pid_t last_pid;          /* Pid of the last (rightmost) process; its exit status = $? */
+    int   exit_status;       /* Exit status of last process in this job */
 
     /* pid array for all processes in this pipeline */
     pid_t *pids;
@@ -135,7 +134,6 @@ allocate_job(bool includeinjoblist)
     job->jid = -1;
     job->pgid = 0;
     job->exit_status = 0;
-    job->last_pid = -1;
     job->pids = NULL;
     job->npids = 0;
     if (!includeinjoblist)
@@ -296,24 +294,29 @@ handle_child_status(pid_t pid, int status)
     if (job == NULL)
         return;  /* spurious, ignore */
 
-    /* Step 2 & 3: check what happened and update job state.
-     * For pipelines, $? must reflect the last (rightmost) command.
-     * We only update exit_status when pid == job->last_pid. */
-    bool is_last = (pid == job->last_pid);
-
+    /* Step 2 & 3: check what happened and update job state */
     if (WIFEXITED(status)) {
-        if (is_last)
-            job->exit_status = WEXITSTATUS(status);
+        job->exit_status = WEXITSTATUS(status);
         job->num_processes_alive--;
         if (job->num_processes_alive == 0) {
-            job->status = TERMINATED_VIA_EXIT;
+            if (job->status == FOREGROUND) {
+                job->status = TERMINATED_VIA_EXIT;
+                /* update $? for foreground job when last process exits */
+                update_exit_status(job->exit_status);
+            } else {
+                job->status = TERMINATED_VIA_EXIT;
+            }
         }
     } else if (WIFSIGNALED(status)) {
-        if (is_last)
-            job->exit_status = 128 + WTERMSIG(status);
+        job->exit_status = 128 + WTERMSIG(status);
         job->num_processes_alive--;
         if (job->num_processes_alive == 0) {
-            job->status = TERMINATED_VIA_SIGNAL;
+            if (job->status == FOREGROUND) {
+                job->status = TERMINATED_VIA_SIGNAL;
+                update_exit_status(job->exit_status);
+            } else {
+                job->status = TERMINATED_VIA_SIGNAL;
+            }
         }
     } else if (WIFSTOPPED(status)) {
         job->status = STOPPED;
@@ -340,14 +343,6 @@ expand_word(TSNode node)
     }
 
     if (strcmp(type, "string") == 0) {
-        /* Double-quoted string: walk ALL children to rebuild content.
-         * We cannot simply strip the outer quotes because the string may
-         * contain expansions ($VAR, ${VAR}, $(cmd)) that need evaluation.
-         * For pure-literal strings (only string_content children, or no
-         * named children at all), we extract the text between the quotes
-         * directly so that whitespace-only strings like "  " are preserved.
-         * tree-sitter may absorb leading/trailing whitespace into extras
-         * and produce no string_content node, so we fall back to raw extraction. */
         uint32_t nnamed = ts_node_named_child_count(node);
         if (nnamed == 0) {
             /* No named children: pure literal (possibly whitespace-only).
@@ -504,25 +499,17 @@ try_builtin(char **argv, int *exit_val)
 
 /*
  * Spawn a single command using posix_spawnp.
- * pgid:       process group to join (0 = create new group with own pid as pgid)
- * stdin_fd:   if >= 0, dup2 this to STDIN_FILENO in the child
- * stdout_fd:  if >= 0, dup2 this to STDOUT_FILENO in the child
+ * pgid: process group to join (0 = create new group with own pid as pgid)
  * Returns the pid of the spawned process, or -1 on error.
  */
 static pid_t
-spawn_command(char **argv, pid_t pgid, int stdin_fd, int stdout_fd)
+spawn_command(char **argv, pid_t pgid)
 {
     posix_spawn_file_actions_t file_actions;
     posix_spawnattr_t attr;
 
     posix_spawn_file_actions_init(&file_actions);
     posix_spawnattr_init(&attr);
-
-    /* Wire up pipe ends if provided */
-    if (stdin_fd >= 0)
-        posix_spawn_file_actions_adddup2(&file_actions, stdin_fd, STDIN_FILENO);
-    if (stdout_fd >= 0)
-        posix_spawn_file_actions_adddup2(&file_actions, stdout_fd, STDOUT_FILENO);
 
     /* Set process group */
     posix_spawnattr_setpgroup(&attr, pgid);
@@ -540,106 +527,6 @@ spawn_command(char **argv, pid_t pgid, int stdin_fd, int stdout_fd)
         return -1;
     }
     return pid;
-}
-
-/*
- * Run a pipeline of commands.
- * The pipeline node's named children are the commands; anonymous children
- * are the '|' or '|&' tokens between them.
- * background: whether the whole pipeline runs in the background.
- */
-static void
-run_pipeline(TSNode pipeline_node, bool background)
-{
-    uint32_t nnamed = ts_node_named_child_count(pipeline_node);
-    if (nnamed == 0) return;
-
-    /* Single command in a pipeline node: delegate */
-    if (nnamed == 1) {
-        TSNode cmd = ts_node_named_child(pipeline_node, 0);
-        if (strcmp(ts_node_type(cmd), "command") == 0)
-            run_simple_command(cmd, background);
-        return;
-    }
-
-    struct job *job = allocate_job(true);
-    job->status = background ? BACKGROUND : FOREGROUND;
-    job->pids = malloc(nnamed * sizeof(pid_t));
-    job->npids = 0;
-
-    /* Create (nnamed - 1) pipes up front */
-    int (*pipes)[2] = malloc((nnamed - 1) * sizeof(int[2]));
-    for (uint32_t i = 0; i < nnamed - 1; i++) {
-        if (pipe(pipes[i]) != 0) {
-            utils_error("pipe() failed");
-            for (uint32_t j = 0; j < i; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            free(pipes);
-            delete_job(job, true);
-            return;
-        }
-    }
-
-    pid_t pgid = 0;  /* first child's pid becomes the pgid */
-
-    for (uint32_t i = 0; i < nnamed; i++) {
-        TSNode cmd_node = ts_node_named_child(pipeline_node, i);
-
-        /* stdin comes from previous pipe's read end; stdout goes to current pipe's write end */
-        int stdin_fd  = (i == 0)          ? -1 : pipes[i-1][0];
-        int stdout_fd = (i == nnamed - 1) ? -1 : pipes[i][1];
-
-        char **argv = build_argv(cmd_node, NULL);
-        if (argv == NULL || argv[0] == NULL) {
-            free_argv(argv);
-            continue;
-        }
-
-        pid_t pid = spawn_command(argv, pgid, stdin_fd, stdout_fd);
-        free_argv(argv);
-
-        if (pid == -1) {
-            /* Close remaining pipe ends on error */
-            for (uint32_t j = i; j < nnamed - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            break;
-        }
-
-        if (pgid == 0)
-            pgid = pid;  /* first process becomes process group leader */
-
-        job->pids[job->npids++] = pid;
-        job->num_processes_alive++;
-    }
-
-    job->pgid = pgid;
-
-    /* last_pid is the rightmost command; its exit status becomes $? */
-    if (job->npids > 0)
-        job->last_pid = job->pids[job->npids - 1];
-
-    /* Parent must close all pipe ends so children see EOF correctly */
-    for (uint32_t i = 0; i < nnamed - 1; i++) {
-        close(pipes[i][0]);
-        close(pipes[i][1]);
-    }
-    free(pipes);
-
-    if (job->num_processes_alive == 0) {
-        delete_job(job, true);
-        return;
-    }
-
-    if (!background) {
-        wait_for_job(job);
-        int exit_code = job->exit_status;
-        delete_job(job, true);
-        update_exit_status(exit_code);
-    }
 }
 
 /*
@@ -669,7 +556,7 @@ run_simple_command(TSNode cmd_node, bool background)
     struct job *job = allocate_job(true);
     job->status = background ? BACKGROUND : FOREGROUND;
 
-    pid_t pid = spawn_command(argv, 0, -1, -1);  /* 0 = new process group, no pipe fds */
+    pid_t pid = spawn_command(argv, 0);  /* 0 = new process group */
     free_argv(argv);
 
     if (pid == -1) {
@@ -681,7 +568,6 @@ run_simple_command(TSNode cmd_node, bool background)
 
     /* record the pid in the job */
     job->pgid = pid;  /* first process becomes pgid leader */
-    job->last_pid = pid;
     job->pids = malloc(sizeof(pid_t));
     job->pids[0] = pid;
     job->npids = 1;
@@ -727,18 +613,6 @@ run_statement(TSNode node)
  *
  * A program's named children are various types of statements which 
  * you can start implementing here.
- *
- * The tree-sitter bash grammar wraps statements at the top level.
- * Background commands appear as nodes where the parent has a trailing '&'.
- * In tree-sitter bash, background execution uses:
- *   (program (command ...) "&")   -- but actually the parser puts them
- * inside a list or the & is an anonymous sibling.
- *
- * Looking at the grammar, a background command appears as:
- *   _statements: ... statement & ...
- * The '&' is an anonymous token that follows the statement at the same
- * level in _statements. We need to look at all children (not just named)
- * to detect '&'.
  */
 static void 
 run_program(TSNode program)
@@ -771,22 +645,6 @@ run_program(TSNode program)
 
         if (sym == sym_command) {
             run_simple_command(child, background);
-            /* reap finished background jobs */
-            struct list_elem *e = list_begin(&job_list);
-            while (e != list_end(&job_list)) {
-                struct list_elem *next_e = list_next(e);
-                struct job *j = list_entry(e, struct job, elem);
-                if (j->status != FOREGROUND && j->status != BACKGROUND &&
-                    j->num_processes_alive == 0) {
-                    delete_job(j, true);
-                }
-                e = next_e;
-            }
-            continue;
-        }
-
-        if (sym == sym_pipeline) {
-            run_pipeline(child, background);
             /* reap finished background jobs */
             struct list_elem *e = list_begin(&job_list);
             while (e != list_end(&job_list)) {
