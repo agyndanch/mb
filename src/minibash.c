@@ -1169,58 +1169,17 @@ run_if_statement(TSNode node)
         if (ts_node_is_named(child)) {
             const char *ctype = ts_node_type(child);
 
-            /*
-             * elif_clause and else_clause: recurse using the same state machine
-             * by calling ourselves on their contents.  We pass a synthetic
-             * "elif"/"else" prefix so the keyword handler fires correctly.
-             */
             if (strcmp(ctype, "elif_clause") == 0 ||
                 strcmp(ctype, "else_clause") == 0) {
-                /*
-                 * Process the clause's children inline: scan for keywords
-                 * and statements exactly as we do for the top-level node.
-                 * Reuse the outer `executed`, `state`, `branch_runs`, `pending`.
-                 */
-                uint32_t cn = ts_node_child_count(child);
-                for (uint32_t j = 0; j < cn; j++) {
-                    TSNode cc = ts_node_child(child, j);
 
-                    if (!ts_node_is_named(cc)) {
-                        char *kw = ts_extract_node_text(input, cc);
-                        if (strcmp(kw, "elif") == 0) {
-                            /* Start new condition for elif */
-                            state = S_COND;
-                            npending = 0;
-                            branch_runs = false;
-                        } else if (strcmp(kw, "then") == 0) {
-                            if (!executed) {
-                                for (int k = 0; k < npending; k++)
-                                    run_statement(pending[k]);
-                                branch_runs = (last_exit_status == 0);
-                            } else {
-                                branch_runs = false;
-                            }
-                            if (branch_runs) executed = true;
-                            state = S_BODY;
-                        } else if (strcmp(kw, "else") == 0) {
-                            branch_runs = !executed;
-                            if (branch_runs) executed = true;
-                            state = S_BODY;
-                        }
-                        free(kw);
-                        continue;
-                    }
-                    /* Named child of clause */
-                    if (state == S_COND) {
-                        if (npending < 64) pending[npending++] = cc;
-                    } else { /* S_BODY */
-                        if (branch_runs) {
-                            run_statement(cc);
-                            if (break_flag) return;
-                        }
-                    }
+                if (!executed) {
+                    run_if_statement(child);
+
+                    if (last_exit_status == 0)
+                        executed = true;
                 }
-                continue;  /* done with this clause node */
+
+                continue;
             }
 
             /* Plain named child of if_statement: condition or body statement */
@@ -1410,6 +1369,95 @@ run_compound(TSNode node)
 }
 
 /*
+ * Native evaluator for a test expression node (inside [ ] or [[ ]]).
+ * Returns true if the expression is true, false otherwise.
+ */
+static bool
+eval_test_expr(TSNode node)
+{
+    const char *type = ts_node_type(node);
+
+    if (strcmp(type, "unary_expression") == 0) {
+        char *op = NULL;
+        char *operand = NULL;
+        uint32_t n = ts_node_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode child = ts_node_child(node, i);
+            const char *ctype = ts_node_type(child);
+            if (strcmp(ctype, "test_operator") == 0 && op == NULL) {
+                op = ts_extract_node_text(input, child);
+            } else if (!ts_node_is_named(child) && op == NULL) {
+                char *tok = ts_extract_node_text(input, child);
+                if (tok[0] == '-') op = tok;
+                else free(tok);
+            } else if (ts_node_is_named(child) && strcmp(ctype, "test_operator") != 0 && operand == NULL) {
+                operand = expand_word(child);
+            }
+        }
+        bool result = false;
+        if (op && operand) {
+            if      (strcmp(op, "-x") == 0) result = (access(operand, X_OK) == 0);
+            else if (strcmp(op, "-e") == 0) result = (access(operand, F_OK) == 0);
+            else if (strcmp(op, "-f") == 0) { struct stat st; result = (stat(operand, &st) == 0 && S_ISREG(st.st_mode)); }
+            else if (strcmp(op, "-d") == 0) { struct stat st; result = (stat(operand, &st) == 0 && S_ISDIR(st.st_mode)); }
+            else if (strcmp(op, "-r") == 0) result = (access(operand, R_OK) == 0);
+            else if (strcmp(op, "-w") == 0) result = (access(operand, W_OK) == 0);
+            else if (strcmp(op, "-s") == 0) { struct stat st; result = (stat(operand, &st) == 0 && st.st_size > 0); }
+            else if (strcmp(op, "-z") == 0) result = (operand[0] == '\0');
+            else if (strcmp(op, "-n") == 0) result = (operand[0] != '\0');
+        } else if (operand != NULL) {
+            result = (operand[0] != '\0');
+        }
+        free(op);
+        free(operand);
+        return result;
+    }
+
+    if (strcmp(type, "binary_expression") == 0) {
+        char *left = NULL, *op = NULL, *right = NULL;
+        uint32_t n = ts_node_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode child = ts_node_child(node, i);
+            const char *ctype = ts_node_type(child);
+            if (strcmp(ctype, "test_operator") == 0 && op == NULL) {
+                op = ts_extract_node_text(input, child);
+            } else if (!ts_node_is_named(child)) {
+                char *tok = ts_extract_node_text(input, child);
+                if (op == NULL && left != NULL && tok[0] != '\0' && tok[0] != ' ')
+                    op = tok;
+                else
+                    free(tok);
+            } else if (ts_node_is_named(child) && strcmp(ctype, "test_operator") != 0) {
+                if (left == NULL)       left  = expand_word(child);
+                else if (right == NULL) right = expand_word(child);
+            }
+        }
+        bool result = false;
+        if (left && op && right) {
+            if      (strcmp(op, "=")  == 0 || strcmp(op, "==") == 0) result = (strcmp(left, right) == 0);
+            else if (strcmp(op, "!=") == 0)  result = (strcmp(left, right) != 0);
+            else if (strcmp(op, "-eq") == 0) result = (atoi(left) == atoi(right));
+            else if (strcmp(op, "-ne") == 0) result = (atoi(left) != atoi(right));
+            else if (strcmp(op, "-lt") == 0) result = (atoi(left) <  atoi(right));
+            else if (strcmp(op, "-le") == 0) result = (atoi(left) <= atoi(right));
+            else if (strcmp(op, "-gt") == 0) result = (atoi(left) >  atoi(right));
+            else if (strcmp(op, "-ge") == 0) result = (atoi(left) >= atoi(right));
+            else if (strcmp(op, "<")  == 0)  result = (strcmp(left, right) < 0);
+            else if (strcmp(op, ">")  == 0)  result = (strcmp(left, right) > 0);
+        }
+        free(left); free(op); free(right);
+        return result;
+    }
+
+    /* Recurse into single named child (e.g. parenthesized expression) */
+    uint32_t n = ts_node_named_child_count(node);
+    if (n == 1)
+        return eval_test_expr(ts_node_named_child(node, 0));
+
+    return false;
+}
+
+/*
  * Run a statement node. Dispatches based on node type.
  */
 static void
@@ -1441,6 +1489,15 @@ run_statement(TSNode node)
 
     if (sym == sym_list) {
         run_list(node);
+        return;
+    }
+
+    if (strcmp(type, "test_command") == 0) {
+        bool result = false;
+        uint32_t n = ts_node_named_child_count(node);
+        if (n > 0)
+            result = eval_test_expr(ts_node_named_child(node, 0));
+        update_exit_status(result ? 0 : 1);
         return;
     }
 
