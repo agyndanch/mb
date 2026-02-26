@@ -34,6 +34,19 @@
 #include "list.h"
 #include "ts_helpers.h"
 
+/*
+ * Parse redirect nodes attached to a redirected_statement.
+ * Sets up file actions by opening files or wiring pipe fds.
+ * Returns {stdin_fd, stdout_fd, stderr_fd} as overrides, -1 = no override.
+ * opened_fds: caller-allocated array of fds to close after spawning.
+ * *n_opened: number of fds filled in opened_fds.
+ */
+typedef struct {
+    int stdin_fd;
+    int stdout_fd;
+    int stderr_fd;
+} RedirectFDs;
+
 extern char **environ;
 
 /* These are field ids suitable for use in ts_node_child_by_field_id for certain rules. */
@@ -60,6 +73,7 @@ static void run_statement(TSNode node);
 static char *expand_word(TSNode node);
 static void run_pipeline(TSNode node, bool background);
 static void run_redirected_statement(TSNode node, bool background);
+static RedirectFDs parse_redirects(TSNode redir_stmt, int *opened_fds, int *n_opened);
 
 static void
 usage(char *progname)
@@ -494,6 +508,8 @@ build_argv(TSNode cmd_node, int *argc_out)
 
         if (sym == sym_variable_assignment)
             continue;
+        if (sym == sym_file_redirect || sym == sym_heredoc_redirect)
+            continue;
 
         if (i == 0) {
             TSNode name_child = ts_node_named_child(child, 0);
@@ -747,6 +763,16 @@ run_simple_command_fds(TSNode cmd_node, bool background,
         }
     }
 
+    /* Check for redirect children directly on the command node */
+    int cmd_opened_fds[16];
+    int cmd_n_opened = 0;
+    {
+        RedirectFDs crfds = parse_redirects(cmd_node, cmd_opened_fds, &cmd_n_opened);
+        if (stdin_fd == -1 && crfds.stdin_fd != -1)  stdin_fd = crfds.stdin_fd;
+        if (stdout_fd == -1 && crfds.stdout_fd != -1) stdout_fd = crfds.stdout_fd;
+        if (stderr_fd == -1 && crfds.stderr_fd != -1) stderr_fd = crfds.stderr_fd;
+    }
+
     /* External command */
     bool own_job = (shared_job == NULL);
     struct job *job = own_job ? allocate_job(true) : shared_job;
@@ -761,6 +787,10 @@ run_simple_command_fds(TSNode cmd_node, bool background,
                                    stdin_fd, stdout_fd, stderr_fd,
                                    extra_fds, nextra);
     free_argv(argv);
+
+    /* Close any fds opened for inline command redirects */
+    for (int k = 0; k < cmd_n_opened; k++)
+        close(cmd_opened_fds[k]);
 
     if (pid == -1) {
         update_exit_status(127);
@@ -787,19 +817,6 @@ run_simple_command_fds(TSNode cmd_node, bool background,
         }
     }
 }
-
-/*
- * Parse redirect nodes attached to a redirected_statement.
- * Sets up file actions by opening files or wiring pipe fds.
- * Returns {stdin_fd, stdout_fd, stderr_fd} as overrides, -1 = no override.
- * opened_fds: caller-allocated array of fds to close after spawning.
- * *n_opened: number of fds filled in opened_fds.
- */
-typedef struct {
-    int stdin_fd;
-    int stdout_fd;
-    int stderr_fd;
-} RedirectFDs;
 
 static RedirectFDs
 parse_redirects(TSNode redir_stmt, int *opened_fds, int *n_opened)
@@ -861,6 +878,7 @@ parse_redirects(TSNode redir_stmt, int *opened_fds, int *n_opened)
             /* Not tested, skip */
         }
     }
+
     return r;
 }
 
@@ -887,8 +905,13 @@ run_pipeline(TSNode node, bool background)
     if (ncmds == 1) {
         /* Single-command pipeline: just run it */
         TSNode cmd = ts_node_named_child(node, 0);
-        run_simple_command_fds(cmd, background,
-                               -1, -1, -1, NULL, 0, NULL);
+        TSSymbol cmd_sym = ts_node_symbol(cmd);
+        if (cmd_sym == sym_redirected_statement) {
+            run_redirected_statement(cmd, background);
+        } else {
+            run_simple_command_fds(cmd, background,
+                                   -1, -1, -1, NULL, 0, NULL);
+        }
         return;
     }
 
@@ -903,24 +926,78 @@ run_pipeline(TSNode node, bool background)
             utils_fatal_error("pipe failed");
     }
 
+    /* Track redirect fds opened per command so parent can close them after spawn */
+    int redir_opened_fds[ncmds][16];
+    int redir_n_opened[ncmds];
+    memset(redir_n_opened, 0, sizeof(redir_n_opened));
+
     for (uint32_t i = 0; i < ncmds; i++) {
         TSNode cmd = ts_node_named_child(node, i);
+        TSSymbol cmd_sym = ts_node_symbol(cmd);
 
         int in_fd  = (i == 0)         ? -1 : pipes[i-1][0];
         int out_fd = (i == ncmds - 1) ? -1 : pipes[i][1];
         int err_fd = (pipe_stderr && out_fd != -1) ? out_fd : -1;
 
         /* Collect all OTHER pipe fds to close in child */
-        int extra[2*(ncmds-1)];
+        int extra[2*(ncmds-1) + 16];
         int nextra = 0;
         for (uint32_t j = 0; j < ncmds - 1; j++) {
             if ((int)j != (int)(i-1)) extra[nextra++] = pipes[j][0];
             if ((int)j != (int)i)     extra[nextra++] = pipes[j][1];
         }
 
-        run_simple_command_fds(cmd, background,
-                               in_fd, out_fd, err_fd,
-                               extra, nextra, job);
+        if (cmd_sym == sym_redirected_statement) {
+            /*
+             * A pipeline element may itself be a redirected_statement, e.g.:
+             *   <infile cat | rev | wc -m >outfile
+             * Parse that element's own redirects and merge with the pipeline fds.
+             * Pipeline fds (inter-process pipes) take precedence for piped ends;
+             * file redirects apply to the free (non-piped) ends.
+             */
+            int opened[16];
+            int n_opened = 0;
+            RedirectFDs rfds = parse_redirects(cmd, opened, &n_opened);
+
+            for (int k = 0; k < n_opened; k++)
+                redir_opened_fds[i][k] = opened[k];
+            redir_n_opened[i] = n_opened;
+
+            int final_in  = (in_fd  != -1) ? in_fd  : rfds.stdin_fd;
+            int final_out = (out_fd != -1) ? out_fd : rfds.stdout_fd;
+            int final_err = (err_fd != -1) ? err_fd : rfds.stderr_fd;
+
+            /* Redirect fds not used as final must be closed in child */
+            for (int k = 0; k < n_opened; k++) {
+                if (opened[k] != final_in &&
+                    opened[k] != final_out &&
+                    opened[k] != final_err)
+                    extra[nextra++] = opened[k];
+            }
+
+            TSNode body = ts_node_child_by_field_id(cmd, bodyId);
+            if (ts_node_is_null(body)) {
+                uint32_t nc = ts_node_named_child_count(cmd);
+                for (uint32_t k = 0; k < nc; k++) {
+                    TSNode c = ts_node_named_child(cmd, k);
+                    TSSymbol csym = ts_node_symbol(c);
+                    if (csym != sym_file_redirect && csym != sym_heredoc_redirect) {
+                        body = c;
+                        break;
+                    }
+                }
+            }
+
+            if (!ts_node_is_null(body)) {
+                run_simple_command_fds(body, background,
+                                       final_in, final_out, final_err,
+                                       extra, nextra, job);
+            }
+        } else {
+            run_simple_command_fds(cmd, background,
+                                   in_fd, out_fd, err_fd,
+                                   extra, nextra, job);
+        }
 
         /* Parent closes the write end after spawning each process */
         if (out_fd != -1) {
@@ -935,6 +1012,14 @@ run_pipeline(TSNode node, bool background)
             utils_error("close pipe read end");
     }
     free(pipes);
+
+    /* Parent closes redirect fds opened for individual pipeline elements */
+    for (uint32_t i = 0; i < ncmds; i++) {
+        for (int k = 0; k < redir_n_opened[i]; k++) {
+            if (close(redir_opened_fds[i][k]) != 0)
+                utils_error("close pipeline element redir fd");
+        }
+    }
 
     if (!background) {
         wait_for_job(job);
