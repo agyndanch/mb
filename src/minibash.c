@@ -4,7 +4,7 @@
  * Developed by Godmar Back for CS 3214 Fall 2025 
  * Virginia Tech.
  *
- * Extended by seany24 for CS 3214 Spring 2026
+ * Extended by achang25 and seany24 for CS 3214 Spring 2026
  */
 #define _GNU_SOURCE    1
 #include <stdio.h>
@@ -56,6 +56,7 @@ static TSFieldId leftId, operatorId, rightId;
 
 static char *input;         // to avoid passing the current input around
 static TSParser *parser;    // a singleton parser instance 
+static TSTree *current_tree = NULL; // current parse tree, exposed for child cleanup
 static tommy_hashdyn shell_vars;        // a hash table containing the internal shell variables
 
 /* Last exit status, stored as integer and as string in shell_vars["?"] */
@@ -298,6 +299,13 @@ command_substitution(const char *script)
          * and delete it before returning, leaving parser == NULL */
         ts_parser_delete(parser);
         parser = NULL;
+
+        /* Delete the inherited parse tree to avoid valgrind "possibly lost"
+         * reports in this child process. */
+        if (current_tree != NULL) {
+            ts_tree_delete(current_tree);
+            current_tree = NULL;
+        }
 
         char *script_copy = strdup(script);
         execute_script(script_copy);  /* parser == NULL after this returns */
@@ -587,6 +595,17 @@ try_builtin(char **argv, int *exit_val)
     if (strcmp(argv[0], "continue") == 0) {
         /* continue is not tested but handle symmetrically */
         break_flag = true;
+        *exit_val = 0;
+        return true;
+    }
+
+    /*
+     * : (colon) builtin: does nothing, returns 0.
+     * Prevents posix_spawnp from forking a child that fails to exec,
+     * which would cause valgrind to report tree-sitter allocations as
+     * "possibly lost" in the failed child.
+     */
+    if (strcmp(argv[0], ":") == 0) {
         *exit_val = 0;
         return true;
     }
@@ -1746,11 +1765,13 @@ execute_script(char *script)
 
     input = script;
     TSTree *tree = ts_parser_parse_string(parser, NULL, input, strlen(input));
+    current_tree = tree;
     TSNode  program = ts_tree_root_node(tree);
     signal_block(SIGCHLD);
     run_program(program);
     signal_unblock(SIGCHLD);
     ts_tree_delete(tree);
+    current_tree = NULL;
 
     /* Delete parser to release tree-sitter internal state.
      * Caller (main loop) will recreate it on next call. */
