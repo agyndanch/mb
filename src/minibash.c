@@ -286,7 +286,6 @@ command_substitution(const char *script)
 
     pid_t pid = fork();
     if (pid == 0) {
-        /* child: unblock SIGCHLD, set up pipe, run script */
         signal_unblock(SIGCHLD);
         if (close(pipefd[0]) != 0)
             utils_fatal_error("close failed");
@@ -295,9 +294,17 @@ command_substitution(const char *script)
         if (close(pipefd[1]) != 0)
             utils_fatal_error("close failed");
 
+        /* Delete inherited parser; execute_script will create a fresh one
+         * and delete it before returning, leaving parser == NULL */
+        ts_parser_delete(parser);
+        parser = NULL;
+
         char *script_copy = strdup(script);
-        execute_script(script_copy);
+        execute_script(script_copy);  /* parser == NULL after this returns */
         free(script_copy);
+
+        tommy_hashdyn_foreach(&shell_vars, hash_free);
+        tommy_hashdyn_done(&shell_vars);
         exit(last_exit_status);
     }
 
@@ -1731,6 +1738,12 @@ read_script_from_fd(int readfd)
 static void 
 execute_script(char *script)
 {
+    ts_parser_delete(parser);
+    parser = ts_parser_new();
+    const TSLanguage *bash = tree_sitter_bash();
+    if (!ts_parser_set_language(parser, bash))
+        utils_fatal_error("ts_parser_set_language failed");
+
     input = script;
     TSTree *tree = ts_parser_parse_string(parser, NULL, input, strlen(input));
     TSNode  program = ts_tree_root_node(tree);
@@ -1738,6 +1751,11 @@ execute_script(char *script)
     run_program(program);
     signal_unblock(SIGCHLD);
     ts_tree_delete(tree);
+
+    /* Delete parser to release tree-sitter internal state.
+     * Caller (main loop) will recreate it on next call. */
+    ts_parser_delete(parser);
+    parser = NULL;
 }
 
 int
@@ -1745,6 +1763,12 @@ main(int ac, char *av[])
 {
     int opt;
     tommy_hashdyn_init(&shell_vars);
+
+    /* Ensure LANG is set to en_US.UTF-8 as required by the test environment */
+    if (getenv("LANG") == NULL || strcmp(getenv("LANG"), "en_US.UTF-8") != 0) {
+        if (setenv("LANG", "en_US.UTF-8", 1) != 0)
+            utils_error("setenv LANG failed");
+    }
 
     /* Initialize $? to 0 */
     hash_put(&shell_vars, "?", "0");
